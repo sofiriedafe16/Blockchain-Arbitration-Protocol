@@ -13,6 +13,13 @@
 (define-constant VOTING_PERIOD u144)
 (define-constant MIN_ARBITRATORS u3)
 
+(define-constant PERFORMANCE_REWARD_POOL u5000000)
+(define-constant MIN_DISPUTES_FOR_REWARDS u5)
+(define-constant PERFORMANCE_DECAY_RATE u95)
+
+(define-data-var total-reward-pool uint u0)
+(define-data-var performance-update-height uint u0)
+
 (define-data-var next-dispute-id uint u1)
 (define-data-var next-arbitrator-id uint u1)
 
@@ -315,4 +322,125 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
+
+
+(define-map arbitrator-performance
+  { arbitrator-id: uint }
+  {
+    total-votes: uint,
+    majority-votes: uint,
+    performance-score: uint,
+    last-reward-height: uint,
+    total-rewards-earned: uint
+  }
+)
+
+(define-private (update-performance-score (arbitrator-id uint) (was-majority bool))
+  (let
+    (
+      (current-perf (default-to
+        { total-votes: u0, majority-votes: u0, performance-score: u100, last-reward-height: u0, total-rewards-earned: u0 }
+        (map-get? arbitrator-performance { arbitrator-id: arbitrator-id })
+      ))
+      (new-total-votes (+ (get total-votes current-perf) u1))
+      (new-majority-votes (if was-majority (+ (get majority-votes current-perf) u1) (get majority-votes current-perf)))
+      (majority-rate (if (> new-total-votes u0) (/ (* new-majority-votes u100) new-total-votes) u0))
+      (new-score (/ (+ (* (get performance-score current-perf) PERFORMANCE_DECAY_RATE) (* majority-rate u5)) u100))
+    )
+    (map-set arbitrator-performance
+      { arbitrator-id: arbitrator-id }
+      (merge current-perf {
+        total-votes: new-total-votes,
+        majority-votes: new-majority-votes,
+        performance-score: new-score
+      })
+    )
+    (ok new-score)
+  )
+)
+
+(define-private (calculate-reward (arbitrator-id uint))
+  (let
+    (
+      (perf-data (unwrap! (map-get? arbitrator-performance { arbitrator-id: arbitrator-id }) (ok u0)))
+      (arbitrator-data (unwrap! (map-get? arbitrators { arbitrator-id: arbitrator-id }) (ok u0)))
+    )
+    (if (and 
+          (>= (get total-votes perf-data) MIN_DISPUTES_FOR_REWARDS)
+          (>= (get performance-score perf-data) u80))
+      (let
+        (
+          (base-reward (/ PERFORMANCE_REWARD_POOL u100))
+          (score-multiplier (get performance-score perf-data))
+          (final-reward (/ (* base-reward score-multiplier) u100))
+        )
+        (ok final-reward)
+      )
+      (ok u0)
+    )
+  )
+)
+
+(define-public (distribute-performance-rewards (dispute-id uint))
+  (let
+    (
+      (dispute (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR_DISPUTE_NOT_FOUND))
+    )
+    (if (and (get resolved dispute) (> (var-get total-reward-pool) u0))
+      (ok true)
+      (ok false)
+    )
+  )
+)
+
+(define-private (distribute-single-reward (arb-data { arbitrator-id: uint, won-majority: bool }) (acc uint))
+  (let
+    (
+      (arbitrator-id (get arbitrator-id arb-data))
+      (won-majority (get won-majority arb-data))
+      (reward-amount (unwrap-panic (calculate-reward arbitrator-id)))
+    )
+    (begin
+      (if (and won-majority (> reward-amount u0))
+        (begin
+          (unwrap-panic (update-performance-score arbitrator-id won-majority))
+          (let
+            (
+              (arbitrator-data (unwrap-panic (map-get? arbitrators { arbitrator-id: arbitrator-id })))
+              (arbitrator-address (get address arbitrator-data))
+            )
+            (unwrap-panic (as-contract (transfer-internal tx-sender arbitrator-address reward-amount)))
+            (var-set total-reward-pool (- (var-get total-reward-pool) reward-amount))
+          )
+          true
+        )
+        (begin
+          (unwrap-panic (update-performance-score arbitrator-id won-majority))
+          true
+        )
+      )
+    )
+    (+ acc u1)
+  )
+)
+
+(define-public (fund-reward-pool (amount uint))
+  (begin
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set total-reward-pool (+ (var-get total-reward-pool) amount))
+    (ok (var-get total-reward-pool))
+  )
+)
+
+(define-read-only (get-arbitrator-performance (arbitrator-id uint))
+  (map-get? arbitrator-performance { arbitrator-id: arbitrator-id })
+)
+
+(define-read-only (get-reward-pool-balance)
+  (var-get total-reward-pool)
+)
+
+(define-read-only (get-estimated-reward (arbitrator-id uint))
+  (calculate-reward arbitrator-id)
 )
